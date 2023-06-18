@@ -1,3 +1,5 @@
+"use strict";
+
 import express from 'express';
 import http from 'http';
 import https from 'https';
@@ -5,23 +7,17 @@ import expressWs from 'express-ws';
 import {
     WebUSB
 } from 'usb';
-import path from 'path';
 import yargs from 'yargs';
 import fs from 'fs';
 import {
     hideBin
 } from 'yargs/helpers';
 import {
-    Worker
-} from 'worker_threads';
-import {
-    getHalfWidthTitleLength,
     sanitizeFullWidthTitle,
     sanitizeHalfWidthTitle
 } from 'netmd-js/dist/utils.js';
 import {
     MDTrack,
-    download,
     getDeviceStatus,
     Encoding,
     listContent,
@@ -32,69 +28,12 @@ import {
     prepareDownload,
     EKBOpenSource,
     MDSession,
+    Wireformat
 } from 'netmd-js';
-import {
-    makeGetAsyncPacketIteratorOnWorkerThread
-} from 'netmd-js/dist/node-encrypt-worker.js';
 import {
     Mutex
 } from 'async-mutex';
 
-const NO_MORE = "20492a62-9f53-11ed-af3c-2c56dc399093";
-
-class AsyncBlockingQueue {
-    constructor() {
-        // invariant: at least one of the arrays is empty
-        this.resolvers = [];
-        this.promises = [];
-    }
-    _add() {
-        this.promises.push(new Promise(resolve => {
-            this.resolvers.push(resolve);
-        }));
-    }
-    enqueue(t) {
-        // if (this.resolvers.length) this.resolvers.shift()(t);
-        // else this.promises.push(Promise.resolve(t));
-        if (!this.resolvers.length) this._add();
-        this.resolvers.shift()(t);
-    }
-    kill(){
-        this.enqueue(NO_MORE);
-    }
-    dequeue() {
-        if (!this.promises.length) this._add();
-        return this.promises.shift();
-    }
-    // now some utilities:
-    isEmpty() { // there are no values available
-        return !this.promises.length; // this.length <= 0
-    }
-    isBlocked() { // it's waiting for values
-        return !!this.resolvers.length; // this.length < 0
-    }
-    get length() {
-        return this.promises.length - this.resolvers.length;
-    }
-    [Symbol.asyncIterator]() {
-        // Todo: Use AsyncIterator.from()
-        return {
-            next: () => this.dequeue().then(value => {
-                if(value === NO_MORE){
-                    return { done: true };
-                }else{
-                    return {
-                        done: false,
-                        value
-                    };
-                }
-            }),
-            [Symbol.asyncIterator]() {
-                return this;
-            },
-        };
-    }
-}
 // Compatibility methods. Do NOT use these unless absolutely necessary!!
 export function convertDiscToWMD(source){
     return {
@@ -133,9 +72,9 @@ export function convertTrackToWMD(source){
         ...source,
         duration: Math.ceil(source.duration / 512),
         encoding: ({
-            [Encoding.sp]: "SP",
-            [Encoding.lp2]: "LP2",
-            [Encoding.lp4]: "LP4",
+            [Encoding.sp]: { codec: "SP" },
+            [Encoding.lp2]: { codec: "LP2" },
+            [Encoding.lp4]: { codec: "LP4" },
         })[source.encoding],
     });
 }
@@ -148,8 +87,19 @@ export function convertTrackToNJS(source){
             "SP": Encoding.sp,
             "LP2": Encoding.lp2,
             "LP4": Encoding.lp4,
-        })[["SP", "LP2", "LP4"].includes(source.encoding) ? source.encoding : "SP"],
+        })[["SP", "LP2", "LP4"].includes(source.encoding.codec) ? source.encoding.codec : "SP"],
     }
+}
+
+function isSequential(numbers) {
+    if (numbers.length === 0) return true;
+    let last = numbers[0];
+    for (let num of numbers) {
+        if (num === last) {
+            ++last;
+        } else return false;
+    }
+    return true;
 }
 
 const webusb = new WebUSB({
@@ -212,12 +162,12 @@ function success(res, value) {
     } catch (err) {}
 }
 
-function awaitPromiseReturnStatus(promise, res) {
-    promise.then(value => {
-        success(res, value);
-    }).catch(error => {
-        fail(res, error);
-    })
+async function awaitPromiseReturnStatus(promise, res) {
+    try{
+        success(res, await promise);
+    }catch(ex){
+        fail(res, ex);
+    }
 }
 
 function assertPresent(res, value) {
@@ -287,7 +237,7 @@ async function main() {
                 });
                 res.on('close', release);
                 next();
-            });
+            }).catch(ex => console.log(ex));
         else next();
     });
 
@@ -307,21 +257,32 @@ async function main() {
     setup(app);
 
     // *********************** NetMD initialization **********************
-
-    setInterval(async () => {
-        if (awaitingDeviceLockMutexRelease) {
-            device = await openNewDevice(webusb, netmdLogger);
-            if (device === null) return;
-            awaitingDeviceLockMutexRelease();
-            awaitingDeviceLockMutexRelease = null;
-            console.log("New device connected! Application resumed.");
-            cachedContent = null;
+    setTimeout(async function reloadDevices() {
+        try{
+            if (awaitingDeviceLockMutexRelease) {
+                device = await openNewDevice(webusb, netmdLogger);
+                if (device !== null) {
+                    awaitingDeviceLockMutexRelease();
+                    awaitingDeviceLockMutexRelease = null;
+                    console.log("New device connected! Application resumed.");
+                    cachedContent = null;
+                }
+            }
+        }catch(ex){
+            console.log(ex);
         }
+        setTimeout(reloadDevices, 1000);
     }, 1000);
 
     webusb.addEventListener("disconnect", () => {
+        if(mutex.isLocked()){
+            mutex.cancel();
+            mutex.release();
+        }
+        device = null;
         console.log("Device disconnected.");
         console.log("Awaiting new device...");
+        flushCache();
         mutex.acquire().then(release => awaitingDeviceLockMutexRelease = release);
     });
 
@@ -359,8 +320,18 @@ function setup(app) {
 
     // The 'contentList' capability:
 
-    app.get('/listContent', async (req, res) => {
-        awaitPromiseReturnStatus(new Promise(async q => q(convertDiscToWMD(await getCachedContent()))), res);
+    app.get('/listContent', (req, res) => {
+        if(req.query.flushCache){
+            flushCache();
+        }
+        awaitPromiseReturnStatus(new Promise(async (res, rej) => {
+            try{
+                const content = await getCachedContent();
+                return res(convertDiscToWMD(content));
+            }catch(ex){
+                rej(ex);
+            }
+        }), res);
     });
 
     app.get('/deviceName', (req, res) => {
@@ -418,7 +389,7 @@ function setup(app) {
         if (fullWidthTitle !== undefined) {
             thisGroup.fullWidthTitle = fullWidthTitle;
         }
-        awaitPromiseReturnStatus(rewriteDiscGroups(disc), res);
+        awaitPromiseReturnStatus(rewriteDiscGroups(device, disc), res);
         flushCache();
     });
 
@@ -462,7 +433,7 @@ function setup(app) {
         });
         disc.groups = disc.groups.filter(g => g.tracks.length !== 0).sort((a, b) => a.tracks[0].index - b.tracks[0].index);
         flushCache();
-        awaitPromiseReturnStatus(rewriteDiscGroups(disc), res);
+        awaitPromiseReturnStatus(rewriteDiscGroups(device, disc), res);
     });
 
     app.get('/deleteGroup', async (req, res) => {
@@ -479,12 +450,12 @@ function setup(app) {
             disc.groups.splice(groupIndex, 1);
         }
         flushCache();
-        awaitPromiseReturnStatus(rewriteDiscGroups(disc), res);
+        awaitPromiseReturnStatus(rewriteDiscGroups(device, disc), res);
     });
 
     app.post('/rewriteGroups', async (req, res) => {
         if (!assertPresent(res, req.body.groups));
-        awaitPromiseReturnStatus(rewriteDiscGroups({
+        awaitPromiseReturnStatus(rewriteDiscGroups(device, {
             ...getCachedContent(),
             groups: req.body.groups.map(convertGroupToNJS)
         }), res);
@@ -507,7 +478,7 @@ function setup(app) {
             await sleep(100);
         }
         flushCache();
-        awaitPromiseReturnStatus(rewriteDiscGroups(content), res);
+        awaitPromiseReturnStatus(rewriteDiscGroups(device, content), res);
     });
 
     app.get('/moveTrack', async (req, res) => {
@@ -591,56 +562,74 @@ function setup(app) {
             } = req.query;
             if (!fullWidthTitle) fullWidthTitle = '';
             if (title === undefined || title === null || format === undefined || format === null) ws.close();
-            format = parseInt(format);
+            const WireformatDict = {
+                SP: Wireformat.pcm,
+                LP2: Wireformat.lp2,
+                LP105: Wireformat.l105kbps,
+                LP4: Wireformat.lp4,
+            };
+            format = WireformatDict[format];
 
             let written = 0;
 
+            let lastTime = 0;
+
             function updateProgress() {
-                ws.send(JSON.stringify({
-                    written
-                }));
+                let newTime = new Date().getTime();
+                if(newTime - lastTime > 100){
+                    ws.send(JSON.stringify({
+                        written
+                    }));
+                    lastTime = newTime;
+                }
             }
 
             let halfWidthTitle = sanitizeHalfWidthTitle(title);
             fullWidthTitle = sanitizeFullWidthTitle(fullWidthTitle);
 
-            let queue = new AsyncBlockingQueue();
+            let queue = [];
 
-            let mdTrack = new MDTrack(halfWidthTitle, format, {
-                byteLength: parseInt(totalLength),
-            }, 0x400, fullWidthTitle, () => queue);
-
-            const receivedAllDataPromise = new Promise(res => {
-                ws.on('message', async _piece => {
-                    // Deserialize data
+            ws.on('message', async _piece => {
+                // Deserialize data
+                try{
                     const piece = new Uint8Array(_piece);
-                    if(piece.length === 0){
-                        queue.kill();
-                        res();
-                        return;
+                    const type = piece[0];
+                    if(type === 0){
+                        const iv = piece.subarray(1, 9);
+                        const key = piece.subarray(9, 17);
+                        const data = piece.subarray(17);
+                        queue.push({ iv, key, data });
+                    }else{
+                        console.log(`As of the start of upload, received ${queue.length} packets. Expecting ${totalLength} bytes got ${queue.reduce((a, b) => a + b.data.length, 0)}`);
+                        let mdTrack = new MDTrack(halfWidthTitle, format, {
+                            byteLength: parseInt(totalLength),
+                        }, 0x400, fullWidthTitle, () => ({
+                            async *[Symbol.asyncIterator](){
+                                for(let e of queue){
+                                    yield e;
+                                }
+                            }
+                        }));
+                        await session.downloadTrack(mdTrack, ({
+                            writtenBytes
+                        }) => {
+                            written = writtenBytes;
+                            updateProgress();
+                        });
+
+                        flushCache();
+                        ws.send(JSON.stringify({ terminate: true }));
+                        console.log("Upload completed.");
+                        release();
+
                     }
-                    const iv = piece.subarray(0, 8);
-                    const key = piece.subarray(8, 16);
-                    const data = piece.subarray(16);
-                    queue.enqueue({ iv, key, data });
-                });
+                }catch(ex){
+                    console.log(ex);
+                }
             });
 
-            if(chunked !== 'true'){
-                await receivedAllDataPromise;
-            }
-            
-            await session.downloadTrack(mdTrack, ({
-                writtenBytes
-            }) => {
-                written = writtenBytes;
-                updateProgress();
-            });
-
-            flushCache();
-            ws.close();
-            release();
-        });
+            ws.send(JSON.stringify({ init: true }));
+        }).catch(e => console.log(e));
     });
 
     app.get('/upload', (res, req) => fail(req, "This is a WebSocket-only endpoint."));

@@ -13,7 +13,7 @@
     "async-mutex": "^0.3.2",
     "express": "^4.17.1",
     "express-ws": "^5.0.2",
-    "netmd-js": "^4.1.2",
+    "netmd-js": "file:../netmd-js-workingtree",
     "usb": "^2.7.0",
     "yargs": "^17.3.1"
   }
